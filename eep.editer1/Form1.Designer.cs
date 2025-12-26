@@ -1,6 +1,6 @@
 ﻿namespace eep.editer1
 {
-    partial class Form1
+    partial class metier
     {
         /// <summary>
         ///  Required designer variable.
@@ -29,7 +29,7 @@
         private void InitializeComponent()
         {
             components = new System.ComponentModel.Container();
-            System.ComponentModel.ComponentResourceManager resources = new System.ComponentModel.ComponentResourceManager(typeof(Form1));
+            System.ComponentModel.ComponentResourceManager resources = new System.ComponentModel.ComponentResourceManager(typeof(metier));
             richTextBox1 = new RichTextBox();
             cursorBox = new PictureBox();
             timer1 = new System.Windows.Forms.Timer(components);
@@ -60,7 +60,7 @@
             timer1.Enabled = true;
             timer1.Interval = 15;
             // 
-            // Form1
+            // metier
             // 
             AutoScaleDimensions = new SizeF(10F, 25F);
             AutoScaleMode = AutoScaleMode.Font;
@@ -68,8 +68,9 @@
             Controls.Add(cursorBox);
             Controls.Add(richTextBox1);
             Icon = (Icon)resources.GetObject("$this.Icon");
-            Name = "Form1";
-            Text = "Form1";
+            Name = "metier";
+            Text = "metier";
+            Load += Form1_Load;
             ((System.ComponentModel.ISupportInitialize)cursorBox).EndInit();
             ResumeLayout(false);
         }

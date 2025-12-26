@@ -1,281 +1,135 @@
-#nullable disable // null警告を無視
-
+#nullable disable
 using System;
 using System.Drawing;
-using System.Runtime.InteropServices; // DllImport用
 using System.Windows.Forms;
-using System.Text;
+using System.Diagnostics;
+// using System.IO; ← これはFileManagerに移動したので不要です
 
 namespace eep.editer1
 {
-    public partial class Form1 : Form
+    public partial class metier : Form
     {
-        // =========================================================
-        //  Windows API 定義
-        // =========================================================
+        private readonly CursorPhysics _physics;
+        private readonly CursorRenderer _renderer;
+        private readonly CursorInputState _inputState;
+        private readonly TextStyler _textStyler;
+        private readonly FileManager _fileManager; // ★追加
 
-        // --- 1. キャレット隠蔽用 ---
-#pragma warning disable SYSLIB1054
-        [DllImport("user32.dll")]
-        private static extern bool HideCaret(IntPtr hWnd);
-#pragma warning restore SYSLIB1054
+        private Stopwatch _stopwatch;
+        private const float BASE_INTERVAL = 10.0f;
 
-        // --- 2. IME判定用 (imm32.dll) ---
-        [DllImport("imm32.dll")]
-        private static extern IntPtr ImmGetContext(IntPtr hWnd);
+        private const long TIMEOUT_PHYSICS = 1200;
+        private const long TIMEOUT_BLINK = 400;
 
-        [DllImport("imm32.dll")]
-        private static extern bool ImmReleaseContext(IntPtr hWnd, IntPtr hIMC);
-
-        [DllImport("imm32.dll")]
-        private static extern int ImmGetCompositionString(IntPtr hIMC, int dwIndex, StringBuilder lpBuf, int dwBufLen);
-
-        // IME定数
-        private const int GCS_COMPSTR = 0x0008;
-
-        // --- 3. アクセントカラー取得用 (dwmapi.dll) ---
-        [DllImport("dwmapi.dll", PreserveSig = false)]
-        private static extern void DwmGetColorizationColor(out int pcrColorization, out bool pfOpaqueBlend);
-
-        // =========================================================
-        //  パラメータ & メンバ変数
-        // =========================================================
-
-        // 物理演算
-        private float posX = 0;
-        private float posY = 0;
-        private float velX = 0;
-
-        // バネ設定
-        private const float Y_SMOOTH = 0.3f;
-        private const float X_TENSION = 0.15f;
-        private const float RAPID_TENSION = 0.02f;
-        private const float RAPID_FRICTION = 0.85f;
-        private const float FRICTION_FORWARD = 0.65f;
-        private const float FRICTION_BACKWARD = 0.45f;
-        private const float SNAP_THRESHOLD = 0.5f;
-        private const float STOP_VELOCITY = 0.5f;
-
-        // 状態管理
-        private long lastShiftReleaseTime = 0;
-        private Keys lastKeyDown = Keys.None;
-        private long lastInputTime = 0;
-        private float maxTargetX = 0;
-        private const int TYPING_TIMEOUT = 1500;
-
-        // ★色管理
-        private Color systemAccentColor = Color.DeepSkyBlue; // 初期値（取得失敗時の保険）
-
-        public Form1()
+        public metier()
         {
             InitializeComponent();
 
-            // --- Windowsのアクセントカラーを取得して保存 ---
-            GetSystemAccentColor();
+            // --- モジュール初期化 ---
+            _physics = new CursorPhysics();
+            _inputState = new CursorInputState();
+            _renderer = new CursorRenderer(cursorBox);
+            _textStyler = new TextStyler(richTextBox1);
+            _fileManager = new FileManager(richTextBox1); // ★追加: 管理人雇う
 
-            // --- エディタ初期設定 ---
+            _stopwatch = new Stopwatch();
+
+            // エディタ設定
             richTextBox1.Text = "";
             richTextBox1.Font = new Font("Meiryo UI", 14, FontStyle.Regular);
             richTextBox1.ImeMode = ImeMode.On;
+            richTextBox1.AcceptsTab = true;
 
-            // --- イベント登録 ---
-            richTextBox1.SelectionChanged += RichTextBox1_SelectionChanged;
-            richTextBox1.Click += RichTextBox1_SelectionChanged;
-            richTextBox1.TextChanged += RichTextBox1_TextChanged;
-            richTextBox1.KeyUp += RichTextBox1_KeyUp;
-            richTextBox1.KeyDown += RichTextBox1_KeyDown;
+            // ★変更: 読み込みをマネージャーに依頼
+            _fileManager.AutoLoad();
 
-            // --- カーソル設定 ---
-            if (cursorBox != null)
+            // ★変更: アプリ終了時に保存をマネージャーに依頼
+            this.FormClosing += (s, e) =>
             {
-                cursorBox.BackColor = Color.Black;
-                cursorBox.Width = 2;
-                cursorBox.Visible = true;
-                cursorBox.BringToFront();
-            }
+                _fileManager.AutoSave();
+            };
 
-            // --- タイマー開始 ---
+            // イベント登録
+            richTextBox1.SelectionChanged += (s, e) =>
+            {
+                NativeMethods.HideCaret(richTextBox1.Handle);
+                _renderer.ResetBlink();
+            };
+            richTextBox1.Click += (s, e) =>
+            {
+                NativeMethods.HideCaret(richTextBox1.Handle);
+                _renderer.ResetBlink();
+            };
+
+            richTextBox1.TextChanged += RichTextBox1_TextChanged;
+            richTextBox1.KeyDown += RichTextBox1_KeyDown;
+            richTextBox1.KeyUp += RichTextBox1_KeyUp;
+
             timer1.Interval = 10;
             timer1.Tick += Timer1_Tick;
+
+            _stopwatch.Start();
             timer1.Start();
         }
 
-        // --- アクセントカラー取得ロジック ---
-        private void GetSystemAccentColor()
+        private void Timer1_Tick(object sender, EventArgs e)
         {
-            try
-            {
-                int colorRaw;
-                bool opaque;
-                // Windowsの設定色を取得
-                DwmGetColorizationColor(out colorRaw, out opaque);
+            float elapsedMs = (float)_stopwatch.Elapsed.TotalMilliseconds;
+            _stopwatch.Restart();
+            if (elapsedMs > 100f) elapsedMs = 10.0f;
+            else if (elapsedMs <= 0f) elapsedMs = 10.0f;
+            float deltaTime = elapsedMs / BASE_INTERVAL;
 
-                // アルファ値(透明度)を255(不透明)に強制してColor型に変換
-                systemAccentColor = Color.FromArgb(255, Color.FromArgb(colorRaw));
-            }
-            catch
-            {
-                // 失敗したら明るめの青にする
-                systemAccentColor = Color.DodgerBlue;
-            }
+            var realTargetPos = GetCaretPosition();
+            bool isComposing = _inputState.IsImeComposing(richTextBox1.Handle);
+            bool isDeleting = _inputState.IsDeleting();
+
+            long elapsedInput = _inputState.GetMillisecondsSinceLastInput();
+            bool isTypingForPhysics = (elapsedInput < TIMEOUT_PHYSICS);
+            bool isTypingForBlink = (elapsedInput < TIMEOUT_BLINK);
+
+            Font currentFont = richTextBox1.SelectionFont ?? richTextBox1.Font;
+            float ratchetThreshold = currentFont.Size * 3.0f;
+            int cursorHeight = currentFont.Height;
+
+            Color currentColor = richTextBox1.SelectionColor;
+
+            _physics.Update(realTargetPos, isTypingForPhysics, isDeleting, ratchetThreshold, deltaTime);
+            _renderer.Render(_physics.PosX, _physics.PosY, cursorHeight, isComposing, isTypingForBlink, currentColor);
+
+            NativeMethods.HideCaret(richTextBox1.Handle);
         }
-
-        // =========================================================
-        //  イベントハンドラ
-        // =========================================================
 
         private void RichTextBox1_KeyDown(object sender, KeyEventArgs e)
         {
-            lastKeyDown = e.KeyCode;
+            _inputState.RegisterKeyDown(e.KeyCode);
+            _renderer.ResetBlink();
+
+            if (e.KeyCode == Keys.Tab)
+            {
+                bool keepTriggerWord = e.Shift;
+                if (_textStyler.ToggleColor(keepTriggerWord))
+                {
+                    e.SuppressKeyPress = true;
+                }
+            }
+        }
+
+        private void RichTextBox1_KeyUp(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.ShiftKey)
+            {
+                _textStyler.HandleShiftKeyUp();
+            }
         }
 
         private void RichTextBox1_TextChanged(object sender, EventArgs e)
         {
-            lastInputTime = DateTime.Now.Ticks / 10000;
-            HideCaret(richTextBox1.Handle);
-            RichTextBox1_SelectionChanged(sender, e);
+            _inputState.RegisterInput();
+            NativeMethods.HideCaret(richTextBox1.Handle);
+            _textStyler.CheckEmptyLineAndReset();
         }
 
-        // ★★★ メインループ ★★★
-        private void Timer1_Tick(object sender, EventArgs e)
-        {
-            // -----------------------------------------------------
-            // 1. IME判定 & 見た目変更 (色・太さ)
-            // -----------------------------------------------------
-            bool isComposing = IsImeComposing(richTextBox1.Handle);
-
-            if (isComposing)
-            {
-                // IME入力中: ★アクセントカラー & ★太くする(5px)
-                cursorBox.BackColor = systemAccentColor;
-                cursorBox.Width = 5;
-            }
-            else
-            {
-                // 通常時: 黒 & 細くする(2px)
-                cursorBox.BackColor = Color.Black;
-                cursorBox.Width = 2;
-            }
-
-            // -----------------------------------------------------
-            // 2. 物理演算
-            // -----------------------------------------------------
-            var realTargetPos = GetCaretPosition();
-            float effectiveTargetX = realTargetPos.X;
-
-            long now = DateTime.Now.Ticks / 10000;
-            long elapsed = now - lastInputTime;
-
-            bool isTyping = (elapsed < TYPING_TIMEOUT);
-            bool isDeleting = (lastKeyDown == Keys.Back || lastKeyDown == Keys.Left);
-
-            // ラチェット
-            if (isTyping && !isDeleting)
-            {
-                if (realTargetPos.X >= maxTargetX)
-                {
-                    maxTargetX = realTargetPos.X;
-                    effectiveTargetX = realTargetPos.X;
-                }
-                else
-                {
-                    float jumpDistance = maxTargetX - realTargetPos.X;
-                    Font currentFont = richTextBox1.SelectionFont;
-                    if (currentFont == null) currentFont = richTextBox1.Font;
-                    float threshold = currentFont.Size * 3.0f;
-
-                    if (jumpDistance < threshold) effectiveTargetX = maxTargetX;
-                    else
-                    {
-                        maxTargetX = realTargetPos.X;
-                        effectiveTargetX = realTargetPos.X;
-                    }
-                }
-            }
-            else if (!isTyping)
-            {
-                maxTargetX = realTargetPos.X;
-                effectiveTargetX = realTargetPos.X;
-            }
-            else
-            {
-                maxTargetX = realTargetPos.X;
-                effectiveTargetX = realTargetPos.X;
-            }
-
-            // Y軸
-            posY += (realTargetPos.Y - posY) * Y_SMOOTH;
-
-            // X軸
-            float diffX = effectiveTargetX - posX;
-            float diffY = Math.Abs(realTargetPos.Y - posY);
-
-            if (diffY > 5.0f)
-            {
-                posX += diffX * 0.3f;
-                velX = 0;
-            }
-            else if (Math.Abs(diffX) < SNAP_THRESHOLD && Math.Abs(velX) < STOP_VELOCITY)
-            {
-                posX = effectiveTargetX;
-                velX = 0;
-            }
-            else
-            {
-                float tension;
-                float friction;
-                bool isMovingLeft = (diffX < 0);
-
-                if (isTyping && !isMovingLeft)
-                {
-                    tension = RAPID_TENSION;
-                    friction = RAPID_FRICTION;
-                }
-                else if (isMovingLeft)
-                {
-                    tension = X_TENSION;
-                    friction = FRICTION_BACKWARD;
-                }
-                else
-                {
-                    tension = X_TENSION;
-                    friction = FRICTION_FORWARD;
-                }
-
-                float force = diffX * tension;
-                velX += force;
-                velX *= friction;
-                posX += velX;
-            }
-
-            // 描画
-            cursorBox.Location = new Point((int)posX, (int)posY);
-            Font f = richTextBox1.SelectionFont;
-            int h = (f != null) ? f.Height : richTextBox1.Font.Height;
-            cursorBox.Height = h;
-
-            HideCaret(richTextBox1.Handle);
-        }
-
-        // --- ヘルパー: IME判定 ---
-        private bool IsImeComposing(IntPtr hWnd)
-        {
-            IntPtr hIMC = ImmGetContext(hWnd);
-            if (hIMC == IntPtr.Zero) return false;
-
-            try
-            {
-                // 未確定文字列の長さを取得
-                int strLen = ImmGetCompositionString(hIMC, GCS_COMPSTR, null, 0);
-                return (strLen > 0);
-            }
-            finally
-            {
-                ImmReleaseContext(hWnd, hIMC);
-            }
-        }
-
-        // --- ヘルパー: 座標 ---
         private Point GetCaretPosition()
         {
             int index = richTextBox1.SelectionStart;
@@ -288,63 +142,12 @@ namespace eep.editer1
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
-            HideCaret(richTextBox1.Handle);
+            NativeMethods.HideCaret(richTextBox1.Handle);
         }
 
-        private void RichTextBox1_SelectionChanged(object sender, EventArgs e)
+        private void Form1_Load(object sender, EventArgs e)
         {
-            HideCaret(richTextBox1.Handle);
-        }
 
-        private void RichTextBox1_KeyUp(object sender, KeyEventArgs e)
-        {
-            if (e.KeyCode == Keys.ShiftKey)
-            {
-                long now = DateTime.Now.Ticks / 10000;
-                if (now - lastShiftReleaseTime < 600)
-                {
-                    ToggleHeadingStyle();
-                    lastShiftReleaseTime = 0;
-                }
-                else
-                {
-                    lastShiftReleaseTime = now;
-                }
-            }
-
-            if (e.KeyCode == Keys.Enter)
-            {
-                richTextBox1.SelectionFont = new Font("Meiryo UI", 14, FontStyle.Regular);
-            }
-        }
-
-        private void ToggleHeadingStyle()
-        {
-            int originalIndex = richTextBox1.SelectionStart;
-            Font currentFont = richTextBox1.SelectionFont;
-            bool toHeading = (currentFont == null || currentFont.Size < 20);
-
-            Font targetFont = toHeading
-                ? new Font("Meiryo UI", 24, FontStyle.Bold)
-                : new Font("Meiryo UI", 14, FontStyle.Regular);
-
-            int lineIndex = richTextBox1.GetLineFromCharIndex(originalIndex);
-            int startPos = richTextBox1.GetFirstCharIndexFromLine(lineIndex);
-            int nextLineStartPos = richTextBox1.GetFirstCharIndexFromLine(lineIndex + 1);
-
-            int lineLength = (nextLineStartPos == -1)
-                ? richTextBox1.TextLength - startPos
-                : nextLineStartPos - startPos;
-
-            if (lineLength > 0)
-            {
-                richTextBox1.Select(startPos, lineLength);
-                richTextBox1.SelectionFont = targetFont;
-            }
-
-            richTextBox1.Select(originalIndex, 0);
-            richTextBox1.SelectionFont = targetFont;
-            richTextBox1.Focus();
         }
     }
 }
